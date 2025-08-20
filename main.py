@@ -23,19 +23,12 @@ CACHE_TTL_SECONDS = 3600  # TTL padrão (1h)
 tile_cache: dict[str, tuple[bytes, str, float]] = {}
 cache_lock = asyncio.Lock()
 
-# Métricas em memória (globais)
+# Métricas em memória
 metrics = {
     "total_requests": 0,
     "cache_hits": 0,
     "upstream_calls": 0,
     "upstream_errors": 0,
-}
-# Métricas por índice
-metrics_by_index: dict[str, dict[str, int]] = {
-    "total_requests": {},
-    "cache_hits": {},
-    "upstream_calls": {},
-    "upstream_errors": {},
 }
 metrics_lock = asyncio.Lock()
 
@@ -74,16 +67,7 @@ def _compute_ttl_seconds_from_headers(headers: dict) -> int:
 async def here_proxy(path: str, request: Request):
     """
     Proxy assíncrono para tiles do HERE Maps com pool de conexões e cache em memória.
-    Suporta um parâmetro de métrica `indice`, que NÃO é encaminhado ao HERE.
-    Pode ser enviado como query (?indice=123) ou no final do path (/indice=123).
     """
-    # Extrai indice do path se presente como sufixo /indice=...
-    indice_from_path = None
-    m = re.match(r"^(.*)/indice=([^/]+)$", path)
-    if m:
-        path = m.group(1)
-        indice_from_path = m.group(2)
-
     # Normaliza o path para evitar duplicação de "mc/"
     if path.startswith("mc/"):
         path = path[3:]
@@ -93,16 +77,9 @@ async def here_proxy(path: str, request: Request):
 
     from urllib.parse import urlencode
 
-    # Lê indice da query (prioridade ao sufixo no path)
-    indice_q = request.query_params.get("indice")
-    indice = indice_from_path or indice_q or "unknown"
-
-    # Monta params sem o "indice" para NÃO repassar ao HERE
-    params_items = [
-        (k, v) for (k, v) in request.query_params.multi_items() if k != "indice"
-    ]
+    params_items = list(request.query_params.multi_items())
     params_items.sort()
-    cache_key = f"{here_url}?{urlencode(params_items)}|indice={indice}"
+    cache_key = f"{here_url}?{urlencode(params_items)}"
 
     now = time.time()
     async with cache_lock:
@@ -114,17 +91,12 @@ async def here_proxy(path: str, request: Request):
             async with metrics_lock:
                 metrics["total_requests"] += 1
                 metrics["cache_hits"] += 1
-                d = metrics_by_index["total_requests"]
-                d[indice] = d.get(indice, 0) + 1
-                d = metrics_by_index["cache_hits"]
-                d[indice] = d.get(indice, 0) + 1
             return Response(
                 content=content_bytes,
                 media_type=content_type,
                 headers={
                     "Cache-Control": f"public, max-age={remaining}",
                     "X-Cache": "HIT",
-                    "X-Index": indice,
                 },
             )
 
@@ -133,22 +105,16 @@ async def here_proxy(path: str, request: Request):
     async with metrics_lock:
         metrics["total_requests"] += 1
         metrics["upstream_calls"] += 1
-        d = metrics_by_index["total_requests"]
-        d[indice] = d.get(indice, 0) + 1
-        d = metrics_by_index["upstream_calls"]
-        d[indice] = d.get(indice, 0) + 1
     try:
-        resp = await client.get(here_url, params=params_items)
+        resp = await client.get(here_url, params=request.query_params)
     except httpx.HTTPError as exc:
         async with metrics_lock:
             metrics["upstream_errors"] += 1
-            d = metrics_by_index["upstream_errors"]
-            d[indice] = d.get(indice, 0) + 1
         return Response(
             content=f'{{"error":"Upstream error","detail":"{str(exc)}"}}',
             media_type="application/json",
             status_code=502,
-            headers={"X-Cache": "MISS", "X-Index": indice},
+            headers={"X-Cache": "MISS"},
         )
 
     if resp.status_code == 200:
@@ -165,7 +131,6 @@ async def here_proxy(path: str, request: Request):
             headers={
                 "Cache-Control": f"public, max-age={ttl}",
                 "X-Cache": "MISS",
-                "X-Index": indice,
             },
         )
 
@@ -173,14 +138,12 @@ async def here_proxy(path: str, request: Request):
     if resp.status_code >= 400:
         async with metrics_lock:
             metrics["upstream_errors"] += 1
-            d = metrics_by_index["upstream_errors"]
-            d[indice] = d.get(indice, 0) + 1
 
     return Response(
         content=f'{{"error":"Erro ao acessar HERE API","status":{resp.status_code},"url":"{resp.request.url}"}}',
         media_type="application/json",
         status_code=resp.status_code,
-        headers={"X-Cache": "MISS", "X-Index": indice},
+        headers={"X-Cache": "MISS"},
     )
 
 
@@ -211,7 +174,6 @@ async def metrics_json():
 async def metrics_prometheus():
     async with metrics_lock:
         m = dict(metrics)
-        mbi = {k: dict(v) for k, v in metrics_by_index.items()}
     total = m.get("total_requests", 0)
     hits = m.get("cache_hits", 0)
     upstream_calls = m.get("upstream_calls", 0)
@@ -225,23 +187,6 @@ async def metrics_prometheus():
         f"here_proxy_upstream_errors_total {upstream_errors}",
         f"here_proxy_cache_hit_ratio {hit_ratio}",
     ]
-
-    # Por índice (com label indice="...")
-    indices = set()
-    for d in mbi.values():
-        indices.update(d.keys())
-    for idx in sorted(indices):
-        t = mbi["total_requests"].get(idx, 0)
-        h = mbi["cache_hits"].get(idx, 0)
-        u = mbi["upstream_calls"].get(idx, 0)
-        e = mbi["upstream_errors"].get(idx, 0)
-        hr = (h / t) if t else 0.0
-        lines.append(f'here_proxy_total_requests{{indice="{idx}"}} {t}')
-        lines.append(f'here_proxy_cache_hits_total{{indice="{idx}"}} {h}')
-        lines.append(f'here_proxy_upstream_calls_total{{indice="{idx}"}} {u}')
-        lines.append(f'here_proxy_upstream_errors_total{{indice="{idx}"}} {e}')
-        lines.append(f'here_proxy_cache_hit_ratio{{indice="{idx}"}} {hr}')
-
     body = "\n".join(lines) + "\n"
     return Response(content=body, media_type="text/plain; version=0.0.4")
 
