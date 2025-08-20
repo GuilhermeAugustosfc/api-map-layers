@@ -23,6 +23,15 @@ CACHE_TTL_SECONDS = 3600  # TTL padrão (1h)
 tile_cache: dict[str, tuple[bytes, str, float]] = {}
 cache_lock = asyncio.Lock()
 
+# Métricas em memória
+metrics = {
+    "total_requests": 0,
+    "cache_hits": 0,
+    "upstream_calls": 0,
+    "upstream_errors": 0,
+}
+metrics_lock = asyncio.Lock()
+
 
 @app.on_event("startup")
 async def startup() -> None:
@@ -79,21 +88,33 @@ async def here_proxy(path: str, request: Request):
         content_bytes, content_type, expires_at = cached
         if expires_at > now:
             remaining = int(max(1, expires_at - now))
+            async with metrics_lock:
+                metrics["total_requests"] += 1
+                metrics["cache_hits"] += 1
             return Response(
                 content=content_bytes,
                 media_type=content_type,
-                headers={"Cache-Control": f"public, max-age={remaining}"},
+                headers={
+                    "Cache-Control": f"public, max-age={remaining}",
+                    "X-Cache": "HIT",
+                },
             )
 
     # Busca upstream de forma assíncrona
     client: httpx.AsyncClient = app.state.http_client
+    async with metrics_lock:
+        metrics["total_requests"] += 1
+        metrics["upstream_calls"] += 1
     try:
         resp = await client.get(here_url, params=request.query_params)
     except httpx.HTTPError as exc:
+        async with metrics_lock:
+            metrics["upstream_errors"] += 1
         return Response(
             content=f'{{"error":"Upstream error","detail":"{str(exc)}"}}',
             media_type="application/json",
             status_code=502,
+            headers={"X-Cache": "MISS"},
         )
 
     if resp.status_code == 200:
@@ -107,13 +128,22 @@ async def here_proxy(path: str, request: Request):
         return Response(
             content=content_bytes,
             media_type=content_type,
-            headers={"Cache-Control": f"public, max-age={ttl}"},
+            headers={
+                "Cache-Control": f"public, max-age={ttl}",
+                "X-Cache": "MISS",
+            },
         )
+
+    # Conta erro upstream (status != 200)
+    if resp.status_code >= 400:
+        async with metrics_lock:
+            metrics["upstream_errors"] += 1
 
     return Response(
         content=f'{{"error":"Erro ao acessar HERE API","status":{resp.status_code},"url":"{resp.request.url}"}}',
         media_type="application/json",
         status_code=resp.status_code,
+        headers={"X-Cache": "MISS"},
     )
 
 
@@ -127,6 +157,38 @@ async def here_proxy_options():
             "Access-Control-Allow-Credentials": "true",
         }
     )
+
+
+@app.get("/metrics")
+async def metrics_json():
+    async with metrics_lock:
+        data = dict(metrics)
+    total = data.get("total_requests", 0)
+    hits = data.get("cache_hits", 0)
+    hit_ratio = (hits / total) if total else 0.0
+    data["cache_hit_ratio"] = round(hit_ratio, 6)
+    return data
+
+
+@app.get("/metrics/prometheus")
+async def metrics_prometheus():
+    async with metrics_lock:
+        m = dict(metrics)
+    total = m.get("total_requests", 0)
+    hits = m.get("cache_hits", 0)
+    upstream_calls = m.get("upstream_calls", 0)
+    upstream_errors = m.get("upstream_errors", 0)
+    hit_ratio = (hits / total) if total else 0.0
+
+    lines = [
+        f"here_proxy_total_requests {total}",
+        f"here_proxy_cache_hits_total {hits}",
+        f"here_proxy_upstream_calls_total {upstream_calls}",
+        f"here_proxy_upstream_errors_total {upstream_errors}",
+        f"here_proxy_cache_hit_ratio {hit_ratio}",
+    ]
+    body = "\n".join(lines) + "\n"
+    return Response(content=body, media_type="text/plain; version=0.0.4")
 
 
 if __name__ == "__main__":
