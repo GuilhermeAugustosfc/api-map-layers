@@ -8,6 +8,8 @@ import re
 import redis.asyncio as aioredis
 from collections import OrderedDict
 from functools import lru_cache
+import psutil
+import os
 
 # Context manager para lifespan do FastAPI
 from contextlib import asynccontextmanager
@@ -23,7 +25,31 @@ REDIS_PASSWORD = None
 REDIS_KEY_PREFIX = "tile_cache:"
 
 # Cache local (client-side caching) com invalidação por tracking
-LOCAL_CACHE_MAX_ENTRIES = 5000
+# Estratégia: máximo 20% da memória disponível da máquina
+# Tamanho médio das imagens: 400KB
+AVERAGE_IMAGE_SIZE_KB = 400
+MAX_MEMORY_PERCENT = 20  # 20% da memória disponível
+
+
+def _calculate_cache_limit() -> int:
+    """Calcula o limite de entradas do cache baseado na memória disponível"""
+    try:
+        memory = psutil.virtual_memory()
+        # Converte memória disponível para KB
+        available_memory_kb = memory.available / 1024
+        # Calcula 20% da memória disponível
+        max_cache_memory_kb = available_memory_kb * (MAX_MEMORY_PERCENT / 100)
+        # Calcula quantas imagens cabem nessa memória
+        max_entries = int(max_cache_memory_kb / AVERAGE_IMAGE_SIZE_KB)
+        # Limite mínimo de segurança
+        return max(100, min(max_entries, 100000))
+    except Exception:
+        # Fallback para o valor padrão em caso de erro
+        return 5000
+
+
+# Cache local com limite dinâmico baseado na memória
+LOCAL_CACHE_MAX_ENTRIES = _calculate_cache_limit()
 local_cache: "dict[str, tuple[bytes, str, float]]" = (
     {}
 )  # Otimizado: dict nativo ao invés de OrderedDict
@@ -96,8 +122,8 @@ async def lifespan(app: FastAPI):
         port=REDIS_PORT,
         db=REDIS_DB,
         password=REDIS_PASSWORD,
-        socket_timeout=3,
-        socket_connect_timeout=3,
+        socket_timeout=1,
+        socket_connect_timeout=1,
         retry_on_timeout=True,
         decode_responses=False,
         health_check_interval=30,
@@ -481,6 +507,112 @@ async def here_proxy_options():
             "Access-Control-Allow-Credentials": "true",
         }
     )
+
+
+@app.get("/system-status")
+async def system_status():
+    """Retorna informações sobre recursos do sistema e uso de memória"""
+    try:
+        # Informações de memória do sistema
+        memory = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+
+        # Informações de CPU
+        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_count = psutil.cpu_count()
+
+        # Informações de disco
+        disk = psutil.disk_usage("/")
+
+        # Informações do processo atual
+        process = psutil.Process(os.getpid())
+        process_memory = process.memory_info()
+        process_cpu = process.cpu_percent()
+
+        # Informações do cache local
+        async with local_cache_lock:
+            local_cache_size = len(local_cache)
+            local_cache_memory_estimate = (
+                local_cache_size * 1024
+            )  # Estimativa: 1KB por entrada
+
+        # Informações de rede
+        network = psutil.net_io_counters()
+
+        status_data = {
+            "system": {
+                "memory": {
+                    "total_gb": round(memory.total / (1024**3), 2),
+                    "available_gb": round(memory.available / (1024**3), 2),
+                    "used_gb": round(memory.used / (1024**3), 2),
+                    "percent_used": memory.percent,
+                    "swap_total_gb": round(swap.total / (1024**3), 2),
+                    "swap_used_gb": round(swap.used / (1024**3), 2),
+                    "swap_percent_used": swap.percent,
+                },
+                "cpu": {"count": cpu_count, "usage_percent": cpu_percent},
+                "disk": {
+                    "total_gb": round(disk.total / (1024**3), 2),
+                    "used_gb": round(disk.used / (1024**3), 2),
+                    "free_gb": round(disk.free / (1024**3), 2),
+                    "percent_used": round((disk.used / disk.total) * 100, 2),
+                },
+                "network": {
+                    "bytes_sent_mb": round(network.bytes_sent / (1024**2), 2),
+                    "bytes_recv_mb": round(network.bytes_recv / (1024**2), 2),
+                },
+            },
+            "application": {
+                "process_id": os.getpid(),
+                "memory": {
+                    "rss_mb": round(process_memory.rss / (1024**2), 2),
+                    "vms_mb": round(process_memory.vms / (1024**2), 2),
+                    "percent_of_system": round(
+                        (process_memory.rss / memory.total) * 100, 4
+                    ),
+                },
+                "cpu_percent": process_cpu,
+                "cache_local": {
+                    "entries": local_cache_size,
+                    "max_entries": LOCAL_CACHE_MAX_ENTRIES,
+                    "memory_estimate_kb": local_cache_memory_estimate,
+                    "memory_estimate_mb": round(local_cache_memory_estimate / 1024, 2),
+                    "max_memory_percent": MAX_MEMORY_PERCENT,
+                    "average_image_size_kb": AVERAGE_IMAGE_SIZE_KB,
+                    "max_cache_memory_mb": round(
+                        (psutil.virtual_memory().available / 1024)
+                        * (MAX_MEMORY_PERCENT / 100)
+                        / 1024,
+                        2,
+                    ),
+                    "memory_usage_percent": (
+                        round(
+                            (local_cache_memory_estimate / 1024)
+                            / (
+                                (psutil.virtual_memory().available / 1024)
+                                * (MAX_MEMORY_PERCENT / 100)
+                                / 1024
+                            )
+                            * 100,
+                            2,
+                        )
+                        if psutil.virtual_memory().available > 0
+                        else 0
+                    ),
+                },
+            },
+            "timestamp": time.time(),
+            "uptime_seconds": time.time() - psutil.boot_time(),
+        }
+
+        return status_data
+
+    except Exception as e:
+        return {
+            "error": "Erro ao obter status do sistema",
+            "detail": str(e),
+            "timestamp": time.time(),
+        }
 
 
 @app.get("/metrics")
