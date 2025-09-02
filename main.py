@@ -7,18 +7,10 @@ import time
 import re
 import redis.asyncio as aioredis
 from collections import OrderedDict
+from functools import lru_cache
 
-# Criando a instância do FastAPI
-app = FastAPI(title="API Simples", description="Uma API simples criada com FastAPI")
-
-# Configurando CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Context manager para lifespan do FastAPI
+from contextlib import asynccontextmanager
 
 # Cliente HTTP global e Redis
 CACHE_TTL_SECONDS = 3600  # TTL padrão (1h)
@@ -32,100 +24,68 @@ REDIS_KEY_PREFIX = "tile_cache:"
 
 # Cache local (client-side caching) com invalidação por tracking
 LOCAL_CACHE_MAX_ENTRIES = 5000
-local_cache: "OrderedDict[str, tuple[bytes, str, float]]" = OrderedDict()
+local_cache: "dict[str, tuple[bytes, str, float]]" = (
+    {}
+)  # Otimizado: dict nativo ao invés de OrderedDict
 local_cache_lock = asyncio.Lock()
+
+# Constantes para strings frequentemente usadas (otimização de memória)
+CACHE_HIT_LOCAL = "HIT-LOCAL"
+CACHE_HIT_REDIS = "HIT-REDIS"
+CACHE_MISS = "MISS"
+CACHE_CONTROL_TEMPLATE = "public, max-age={}"
+X_CACHE_TEMPLATE = "HIT-{}"
+
+# Regex compilado para melhor performance
+MAX_AGE_PATTERN = re.compile(r"max-age=(\d+)")
+
+
+# Classe otimizada para métricas com __slots__
+class Metrics:
+    __slots__ = [
+        "total_requests",
+        "cache_hits",
+        "local_cache_hits",
+        "redis_cache_hits",
+        "upstream_calls",
+        "upstream_errors",
+        "redis_errors",
+        "redis_tracking_active",
+    ]
+
+    def __init__(self):
+        self.total_requests = 0
+        self.cache_hits = 0
+        self.local_cache_hits = 0
+        self.redis_cache_hits = 0
+        self.upstream_calls = 0
+        self.upstream_errors = 0
+        self.redis_errors = 0
+        self.redis_tracking_active = 0
+
+
+# Instância global das métricas
+metrics = Metrics()
+metrics_lock = asyncio.Lock()
 
 
 def _now() -> float:
     return time.time()
 
 
-async def _local_cache_get(key: str) -> "tuple[bytes, str, float] | None":
-    now = _now()
-    async with local_cache_lock:
-        item = local_cache.get(key)
-        if item is None:
-            return None
-        body, content_type, expires_at = item
-        if expires_at <= now:
-            # Expirado localmente
-            local_cache.pop(key, None)
-            return None
-        # Move para o fim (uso recente)
-        local_cache.move_to_end(key)
-        return body, content_type, expires_at
-
-
-async def _local_cache_set(
-    key: str, body: bytes, content_type: str, ttl_seconds: int
-) -> None:
-    if ttl_seconds <= 0:
-        return
-    expires_at = _now() + ttl_seconds
-    async with local_cache_lock:
-        local_cache[key] = (body, content_type, expires_at)
-        local_cache.move_to_end(key)
-        # Evict LRU se exceder limite
-        while len(local_cache) > LOCAL_CACHE_MAX_ENTRIES:
-            local_cache.popitem(last=False)
-
-
-async def _local_cache_evict(keys: list[str]) -> None:
-    if not keys:
-        return
-    async with local_cache_lock:
-        for k in keys:
-            local_cache.pop(k, None)
-
-
-async def _tracking_listener(redis: aioredis.Redis) -> None:
-    # Escuta push messages de invalidação e remove do cache local
-    try:
-        while True:
-            msg = await redis.get_push_data()
-            # Esperado: [b'invalidate', [b'key1', b'key2', ...]]
-            try:
-                if (
-                    isinstance(msg, (list, tuple))
-                    and len(msg) >= 2
-                    and msg[0] == b"invalidate"
-                ):
-                    raw_keys = msg[1] or []
-                    keys: list[str] = []
-                    for rk in raw_keys:
-                        if isinstance(rk, (bytes, bytearray)):
-                            keys.append(rk.decode("utf-8", "ignore"))
-                        elif isinstance(rk, str):
-                            keys.append(rk)
-                    if keys:
-                        await _local_cache_evict(keys)
-            except Exception:
-                # Ignora problemas no parse sem derrubar o listener
-                pass
-    except asyncio.CancelledError:
-        return
-
-
-# Métricas em memória
-metrics = {
-    "total_requests": 0,
-    "cache_hits": 0,
-    "local_cache_hits": 0,
-    "redis_cache_hits": 0,
-    "upstream_calls": 0,
-    "upstream_errors": 0,
-    "redis_errors": 0,
-    "redis_tracking_active": 0,
-}
-metrics_lock = asyncio.Lock()
-
-
-@app.on_event("startup")
-async def startup() -> None:
+# Context manager para lifespan do FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     app.state.http_client = httpx.AsyncClient(
-        http2=False,
-        timeout=httpx.Timeout(10.0, read=30.0, connect=5.0),
-        limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+        http2=True,  # HTTP/2 para melhor performance
+        timeout=httpx.Timeout(
+            5.0, read=15.0, connect=3.0
+        ),  # Otimizado: timeouts mais agressivos
+        limits=httpx.Limits(
+            max_connections=500,  # Otimizado: mais conexões simultâneas
+            max_keepalive_connections=200,
+        ),
         headers={
             # Pode ajustar cabeçalhos padrão se necessário
             "Accept": "*/*",
@@ -161,20 +121,20 @@ async def startup() -> None:
                 )
                 app.state.redis_tracking_active = True
                 async with metrics_lock:
-                    metrics["redis_tracking_active"] = 1
+                    metrics.redis_tracking_active = 1
                 return
             except Exception:
                 app.state.redis_tracking_active = False
                 async with metrics_lock:
-                    metrics["redis_tracking_active"] = 0
+                    metrics.redis_tracking_active = 0
                 await asyncio.sleep(backoff)
                 backoff = min(30, backoff * 2)
 
     app.state.redis_tracking_task = asyncio.create_task(_enable_tracking_with_retry())
 
+    yield  # Aplicação roda aqui
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
+    # Shutdown
     await app.state.http_client.aclose()
     try:
         # redis-py 5 fornece aclose() no cliente assíncrono
@@ -193,9 +153,103 @@ async def shutdown() -> None:
                 pass
 
 
-def _computar_ttl_dos_cabecalhos(cabecalhos: dict) -> int:
+# Criando a instância do FastAPI
+app = FastAPI(
+    title="API Simples",
+    description="Uma API simples criada com FastAPI",
+    lifespan=lifespan,
+)
+
+# Configurando CORS (movido para depois da criação do app)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def _local_cache_get(key: str) -> "tuple[bytes, str, float] | None":
+    now = _now()
+    async with local_cache_lock:
+        item = local_cache.get(key)
+        if item is None:
+            return None
+        body, content_type, expires_at = item
+        if expires_at <= now:
+            # Expirado localmente
+            local_cache.pop(key, None)
+            return None
+        # Move para o fim (uso recente) - simula comportamento LRU
+        local_cache.pop(key)
+        local_cache[key] = item
+        return body, content_type, expires_at
+
+
+async def _local_cache_set(
+    key: str, body: bytes, content_type: str, ttl_seconds: int
+) -> None:
+    if ttl_seconds <= 0:
+        return
+    expires_at = _now() + ttl_seconds
+    async with local_cache_lock:
+        local_cache[key] = (body, content_type, expires_at)
+        # Evict LRU se exceder limite
+        while len(local_cache) > LOCAL_CACHE_MAX_ENTRIES:
+            # Remove o item mais antigo (primeiro da lista)
+            oldest_key = next(iter(local_cache))
+            local_cache.pop(oldest_key)
+
+
+async def _local_cache_evict(keys: list[str]) -> None:
+    if not keys:
+        return
+    async with local_cache_lock:
+        # Otimizado: remove múltiplas chaves de uma vez
+        for k in keys:
+            local_cache.pop(k, None)
+
+
+async def _tracking_listener(redis: aioredis.Redis) -> None:
+    # Escuta push messages de invalidação e remove do cache local
+    try:
+        while True:
+            msg = await redis.get_push_data()
+            # Esperado: [b'invalidate', [b'key1', b'key2', ...]]
+            try:
+                if (
+                    isinstance(msg, (list, tuple))
+                    and len(msg) >= 2
+                    and msg[0] == b"invalidate"
+                ):
+                    raw_keys = msg[1] or []
+                    # Otimizado: list comprehension ao invés de loop
+                    keys = [
+                        (
+                            rk.decode("utf-8", "ignore")
+                            if isinstance(rk, (bytes, bytearray))
+                            else rk
+                        )
+                        for rk in raw_keys
+                        if isinstance(rk, (bytes, bytearray, str))
+                    ]
+                    if keys:
+                        await _local_cache_evict(keys)
+            except Exception:
+                # Ignora problemas no parse sem derrubar o listener
+                pass
+    except asyncio.CancelledError:
+        return
+
+
+# Otimizado: regex compilado e cache de função
+@lru_cache(maxsize=128)
+def _computar_ttl_dos_cabecalhos(cabecalhos_tuple: tuple) -> int:
+    # Converte tuple para dict para processamento
+    cabecalhos = dict(cabecalhos_tuple)
     cache_control = cabecalhos.get("cache-control", "")
-    match = re.search(r"max-age=(\d+)", cache_control)
+    match = MAX_AGE_PATTERN.search(cache_control)
     if match:
         try:
             return int(match.group(1))
@@ -245,7 +299,7 @@ async def _verificar_cache_redis(chave_redis: str) -> "tuple[bytes, str, int] | 
         valores_hm, ttl_restante = await pipe.execute()
     except Exception:
         async with metrics_lock:
-            metrics["redis_errors"] += 1
+            metrics.redis_errors += 1
         return None
 
     if not isinstance(valores_hm, (list, tuple)) or len(valores_hm) != 2:
@@ -276,19 +330,20 @@ async def _buscar_dados_upstream(
         resposta = await client.get(url_here, params=parametros)
     except httpx.HTTPError as erro:
         async with metrics_lock:
-            metrics["upstream_errors"] += 1
+            metrics.upstream_errors += 1
         return None
 
     if resposta.status_code == 200:
         conteudo_bytes = resposta.content
         tipo_conteudo = resposta.headers.get("content-type", "image/png")
-        ttl = _computar_ttl_dos_cabecalhos(resposta.headers)
+        # Otimizado: converte headers para tuple para cache
+        ttl = _computar_ttl_dos_cabecalhos(tuple(resposta.headers.items()))
         return conteudo_bytes, tipo_conteudo, ttl
 
     # Conta erro upstream (status != 200)
     if resposta.status_code >= 400:
         async with metrics_lock:
-            metrics["upstream_errors"] += 1
+            metrics.upstream_errors += 1
 
     return None
 
@@ -307,22 +362,29 @@ async def _salvar_no_cache_redis(
     except Exception:
         # Se falhar o cache, ainda retorna a resposta
         async with metrics_lock:
-            metrics["redis_errors"] += 1
+            metrics.redis_errors += 1
+
+
+# Otimizado: função de atualização de métricas em lote
+async def _atualizar_metricas_batch(updates: dict[str, int]) -> None:
+    """Atualiza múltiplas métricas de uma vez para melhor performance"""
+    async with metrics_lock:
+        for key, value in updates.items():
+            setattr(metrics, key, getattr(metrics, key) + value)
 
 
 async def _atualizar_metricas(tipo_acesso: str) -> None:
     """Atualiza métricas baseado no tipo de acesso ao cache"""
-    async with metrics_lock:
-        metrics["total_requests"] += 1
-
-        if tipo_acesso == "local":
-            metrics["cache_hits"] += 1
-            metrics["local_cache_hits"] += 1
-        elif tipo_acesso == "redis":
-            metrics["cache_hits"] += 1
-            metrics["redis_cache_hits"] += 1
-        elif tipo_acesso == "upstream":
-            metrics["upstream_calls"] += 1
+    if tipo_acesso == "local":
+        await _atualizar_metricas_batch(
+            {"total_requests": 1, "cache_hits": 1, "local_cache_hits": 1}
+        )
+    elif tipo_acesso == "redis":
+        await _atualizar_metricas_batch(
+            {"total_requests": 1, "cache_hits": 1, "redis_cache_hits": 1}
+        )
+    elif tipo_acesso == "upstream":
+        await _atualizar_metricas_batch({"total_requests": 1, "upstream_calls": 1})
 
 
 def _criar_resposta_cache_hit(
@@ -333,8 +395,8 @@ def _criar_resposta_cache_hit(
         content=conteudo,
         media_type=tipo_midia,
         headers={
-            "Cache-Control": f"public, max-age={tempo_restante}",
-            "X-Cache": f"HIT-{tipo_cache}",
+            "Cache-Control": CACHE_CONTROL_TEMPLATE.format(tempo_restante),
+            "X-Cache": X_CACHE_TEMPLATE.format(tipo_cache),
         },
     )
 
@@ -345,8 +407,8 @@ def _criar_resposta_cache_miss(conteudo: bytes, tipo_midia: str, ttl: int) -> Re
         content=conteudo,
         media_type=tipo_midia,
         headers={
-            "Cache-Control": f"public, max-age={ttl}",
-            "X-Cache": "MISS",
+            "Cache-Control": CACHE_CONTROL_TEMPLATE.format(ttl),
+            "X-Cache": CACHE_MISS,
         },
     )
 
@@ -357,7 +419,7 @@ def _criar_resposta_erro_upstream(erro: str, status_code: int = 502) -> Response
         content=f'{{"error":"Erro ao acessar HERE API","detail":"{erro}"}}',
         media_type="application/json",
         status_code=status_code,
-        headers={"X-Cache": "MISS"},
+        headers={"X-Cache": CACHE_MISS},
     )
 
 
@@ -424,7 +486,17 @@ async def here_proxy_options():
 @app.get("/metrics")
 async def metrics_json():
     async with metrics_lock:
-        data = dict(metrics)
+        data = {
+            "total_requests": metrics.total_requests,
+            "cache_hits": metrics.cache_hits,
+            "local_cache_hits": metrics.local_cache_hits,
+            "redis_cache_hits": metrics.redis_cache_hits,
+            "upstream_calls": metrics.upstream_calls,
+            "upstream_errors": metrics.upstream_errors,
+            "redis_errors": metrics.redis_errors,
+            "redis_tracking_active": metrics.redis_tracking_active,
+        }
+
     total = data.get("total_requests", 0)
     hits = data.get("cache_hits", 0)
     local_hits = data.get("local_cache_hits", 0)
@@ -448,7 +520,17 @@ async def metrics_json():
 @app.get("/metrics/prometheus")
 async def metrics_prometheus():
     async with metrics_lock:
-        m = dict(metrics)
+        m = {
+            "total_requests": metrics.total_requests,
+            "cache_hits": metrics.cache_hits,
+            "local_cache_hits": metrics.local_cache_hits,
+            "redis_cache_hits": metrics.redis_cache_hits,
+            "upstream_calls": metrics.upstream_calls,
+            "upstream_errors": metrics.upstream_errors,
+            "redis_errors": metrics.redis_errors,
+            "redis_tracking_active": metrics.redis_tracking_active,
+        }
+
     total = m.get("total_requests", 0)
     hits = m.get("cache_hits", 0)
     local_hits = m.get("local_cache_hits", 0)
