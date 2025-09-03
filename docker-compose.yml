@@ -1,3 +1,5 @@
+version: "2"
+
 services:
   here-proxy:
     build: .
@@ -7,18 +9,5 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/metrics"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
     volumes:
-      # Opcional: montar logs se necessário
       - ./logs:/app/logs
-    networks:
-      - here-proxy-network
-
-networks:
-  here-proxy-network:
-    driver: bridge
