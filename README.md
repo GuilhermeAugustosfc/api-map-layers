@@ -28,13 +28,13 @@ Este projeto implementa um **proxy inteligente** para a API de tiles do HERE Map
                               │
                               ▼
                        ┌─────────────────┐
-                       │   Redis Cache   │
+                       │   Local Memory   │
                        │  (Distribuído)  │
                        └─────────────────┘
                               │
                               ▼
                        ┌─────────────────┐
-                       │ Local Memory    │
+                       │   Redis
                        │   Cache         │
                        └─────────────────┘
 ```
