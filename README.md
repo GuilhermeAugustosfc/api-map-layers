@@ -19,6 +19,8 @@ Este projeto implementa um **proxy inteligente** para a API de tiles do HERE Map
 - 🔄 **Auto-invalidação**: Cache inteligente com tracking Redis
 
 ## 🏗️ Arquitetura
+
+```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Cliente       │───▶│  Map Layer     │───▶│   HERE Maps     │
 │   (Browser)     │    │   Cache Proxy  │    │   API           │
@@ -26,15 +28,16 @@ Este projeto implementa um **proxy inteligente** para a API de tiles do HERE Map
                               │
                               ▼
                        ┌─────────────────┐
-                       │ Local Memory    │
-                       │   Cache         │
+                       │   Redis Cache   │
+                       │  (Distribuído)  │
                        └─────────────────┘
                               │
                               ▼
                        ┌─────────────────┐
-                       │   Redis Cache   │
-                       │  (Distribuído)  │
+                       │ Local Memory    │
+                       │   Cache         │
                        └─────────────────┘
+```
 
 ### Componentes Principais
 
