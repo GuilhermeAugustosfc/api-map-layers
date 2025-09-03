@@ -10,25 +10,67 @@ from collections import OrderedDict
 from functools import lru_cache
 import psutil
 import os
+from typing import Dict, Any
 
 # Context manager para lifespan do FastAPI
 from contextlib import asynccontextmanager
 
-# Cliente HTTP global e Redis
-CACHE_TTL_SECONDS = 3600  # TTL padrão (1h)
 
-# Config Redis (ajuste se necessário)
-REDIS_HOST = "redis-dev.ops.ftrack.me"
-REDIS_PORT = 6379
-REDIS_DB = 0
-REDIS_PASSWORD = None
-REDIS_KEY_PREFIX = "tile_cache:"
+def get_config() -> Dict[str, Any]:
+    """Carrega configuração das variáveis de ambiente com valores padrão"""
+    return {
+        # Redis Configuration
+        "redis_host": os.getenv("REDIS_HOST", "redis-dev.ops.ftrack.me"),
+        "redis_port": int(os.getenv("REDIS_PORT", "6379")),
+        "redis_db": int(os.getenv("REDIS_DB", "0")),
+        "redis_password": os.getenv("REDIS_PASSWORD"),
+        "redis_key_prefix": os.getenv("REDIS_KEY_PREFIX", "tile_cache:"),
+        # Cache Configuration
+        "cache_ttl_seconds": int(os.getenv("CACHE_TTL_SECONDS", "3600")),
+        "average_image_size_kb": int(os.getenv("AVERAGE_IMAGE_SIZE_KB", "400")),
+        "max_memory_percent": int(os.getenv("MAX_MEMORY_PERCENT", "20")),
+        # HTTP Configuration
+        "http_timeout_connect": float(os.getenv("HTTP_TIMEOUT_CONNECT", "3.0")),
+        "http_timeout_read": float(os.getenv("HTTP_TIMEOUT_READ", "15.0")),
+        "http_timeout_total": float(os.getenv("HTTP_TIMEOUT_TOTAL", "5.0")),
+        "http_max_connections": int(os.getenv("HTTP_MAX_CONNECTIONS", "500")),
+        "http_max_keepalive": int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "200")),
+        # Server Configuration
+        "server_host": os.getenv("SERVER_HOST", "0.0.0.0"),
+        "server_port": int(os.getenv("SERVER_PORT", "8000")),
+        # HERE Maps Configuration
+        "here_maps_base_url": os.getenv(
+            "HERE_MAPS_BASE_URL", "https://maps.hereapi.com/v3/base/mc/"
+        ),
+        # Redis Socket Configuration
+        "redis_socket_timeout": float(os.getenv("REDIS_SOCKET_TIMEOUT", "1.0")),
+        "redis_socket_connect_timeout": float(
+            os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "1.0")
+        ),
+        "redis_health_check_interval": int(
+            os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "30")
+        ),
+    }
+
+
+# Carrega configuração das variáveis de ambiente
+config = get_config()
+
+# Cliente HTTP global e Redis
+CACHE_TTL_SECONDS = config["cache_ttl_seconds"]
+
+# Config Redis
+REDIS_HOST = config["redis_host"]
+REDIS_PORT = config["redis_port"]
+REDIS_DB = config["redis_db"]
+REDIS_PASSWORD = config["redis_password"]
+REDIS_KEY_PREFIX = config["redis_key_prefix"]
 
 # Cache local (client-side caching) com invalidação por tracking
 # Estratégia: máximo 20% da memória disponível da máquina
 # Tamanho médio das imagens: 400KB
-AVERAGE_IMAGE_SIZE_KB = 400
-MAX_MEMORY_PERCENT = 20  # 20% da memória disponível
+AVERAGE_IMAGE_SIZE_KB = config["average_image_size_kb"]
+MAX_MEMORY_PERCENT = config["max_memory_percent"]
 
 
 def _calculate_cache_limit() -> int:
@@ -106,11 +148,13 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(
         http2=True,  # HTTP/2 para melhor performance
         timeout=httpx.Timeout(
-            5.0, read=15.0, connect=3.0
-        ),  # Otimizado: timeouts mais agressivos
+            config["http_timeout_total"],
+            read=config["http_timeout_read"],
+            connect=config["http_timeout_connect"],
+        ),  # Configurado via variáveis de ambiente
         limits=httpx.Limits(
-            max_connections=500,  # Otimizado: mais conexões simultâneas
-            max_keepalive_connections=200,
+            max_connections=config["http_max_connections"],
+            max_keepalive_connections=config["http_max_keepalive"],
         ),
         headers={
             # Pode ajustar cabeçalhos padrão se necessário
@@ -118,15 +162,15 @@ async def lifespan(app: FastAPI):
         },
     )
     app.state.redis = aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        password=REDIS_PASSWORD,
-        socket_timeout=1,
-        socket_connect_timeout=1,
+        host=config["redis_host"],
+        port=config["redis_port"],
+        db=config["redis_db"],
+        password=config["redis_password"],
+        socket_timeout=config["redis_socket_timeout"],
+        socket_connect_timeout=config["redis_socket_connect_timeout"],
         retry_on_timeout=True,
         decode_responses=False,
-        health_check_interval=30,
+        health_check_interval=config["redis_health_check_interval"],
     )
 
     # Inicializa tracking em background com retry (não bloqueia startup)
@@ -458,7 +502,7 @@ async def here_proxy(path: str, request: Request):
     path_normalizado = _normalizar_path_here(path)
 
     # Constrói URL do HERE
-    url_base_here = "https://maps.hereapi.com/v3/base/mc/"
+    url_base_here = config["here_maps_base_url"]
     url_here = f"{url_base_here}{path_normalizado}"
 
     # Gera chaves para cache
@@ -697,4 +741,4 @@ async def metrics_prometheus():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=config["server_host"], port=config["server_port"])
