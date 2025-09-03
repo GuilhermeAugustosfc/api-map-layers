@@ -493,8 +493,8 @@ def _criar_resposta_erro_upstream(erro: str, status_code: int = 502) -> Response
     )
 
 
-@app.get("/proxy/{path:path}")
-async def proxy(path: str, request: Request):
+@app.get("/map-tiles/{path:path}")
+async def map_tiles(path: str, request: Request):
     """
     Proxy assíncrono para tiles do HERE Maps com pool de conexões e cache em memória.
     """
@@ -541,8 +541,8 @@ async def proxy(path: str, request: Request):
     return _criar_resposta_cache_miss(conteudo, tipo_midia, ttl)
 
 
-@app.options("/proxy/{path:path}")
-async def proxy_options():
+@app.options("/map-tiles/{path:path}")
+async def map_tiles_options():
     return Response(
         headers={
             "Access-Control-Allow-Origin": "*",

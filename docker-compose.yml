@@ -1,9 +1,9 @@
 version: "2"
 
 services:
-  proxy:
+  map-tiles:
     build: .
-    container_name: proxy-api
+    container_name: map-tiles-api
     ports:
       - "8000:8000"
     environment:
