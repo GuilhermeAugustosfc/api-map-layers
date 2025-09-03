@@ -1,9 +1,9 @@
 version: "2"
 
 services:
-  here-proxy:
+  proxy:
     build: .
-    container_name: here-proxy-api
+    container_name: proxy-api
     ports:
       - "8000:8000"
     environment:

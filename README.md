@@ -164,16 +164,16 @@ docker run -p 8000:8000 \
 ### Proxy HERE Maps
 
 ```http
-GET /here-proxy/{path}
+GET /proxy/{path}
 ```
 
 **Exemplo**:
 ```bash
 # Tile normal
-GET /here-proxy/mc/15/26480/16920/256/png8?apiKey=YOUR_API_KEY
+GET /proxy/mc/15/26480/16920/256/png8?apiKey=YOUR_API_KEY
 
 # Satellite
-GET /here-proxy/mc/15/26480/16920/256/jpg?apiKey=YOUR_API_KEY
+GET /proxy/mc/15/26480/16920/256/jpg?apiKey=YOUR_API_KEY
 ```
 
 **Parâmetros suportados**:

@@ -13,7 +13,7 @@ Documentação técnica detalhada da arquitetura, algoritmos e decisões de desi
 │  ┌─────────────────────────────────────────────────────────┐ │
 │  │               HTTP Layer (Endpoints)                    │ │
 │  ├─────────────────────────────────────────────────────────┤ │
-│  │  • /here-proxy/{path} - Proxy principal                 │ │
+│  │  • /proxy/{path} - Proxy principal                      │ │
 │  │  • /system-status - Status do sistema                   │ │
 │  │  • /metrics - Métricas JSON                             │ │
 │  │  • /metrics/prometheus - Métricas Prometheus           │ │
