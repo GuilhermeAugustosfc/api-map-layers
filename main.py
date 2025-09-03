@@ -532,9 +532,8 @@ async def system_status():
         # Informações do cache local
         async with local_cache_lock:
             local_cache_size = len(local_cache)
-            local_cache_memory_estimate = (
-                local_cache_size * 1024
-            )  # Estimativa: 1KB por entrada
+            # Estimativa corrigida: 400KB por entrada
+            local_cache_memory_estimate = local_cache_size * AVERAGE_IMAGE_SIZE_KB
 
         # Informações de rede
         network = psutil.net_io_counters()
