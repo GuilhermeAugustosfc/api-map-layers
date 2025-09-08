@@ -15,6 +15,9 @@ from typing import Dict, Any
 # Context manager para lifespan do FastAPI
 from contextlib import asynccontextmanager
 
+# Importa os endpoints de ativos
+from ativos_endpoints import create_ativos_endpoints
+
 
 def get_config() -> Dict[str, Any]:
     """Carrega configuração das variáveis de ambiente com valores padrão"""
@@ -238,6 +241,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Registra os endpoints de ativos
+create_ativos_endpoints(app)
 
 
 async def _local_cache_get(key: str) -> "tuple[bytes, str, float] | None":
