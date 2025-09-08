@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copiar código da aplicação
 COPY main.py .
+COPY ativos_endpoints.py .
 
 # Criar usuário não-root para segurança
 RUN adduser --disabled-password --gecos '' appuser && \
